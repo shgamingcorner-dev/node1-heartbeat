@@ -1,9 +1,8 @@
 name: node1 heartbeat check
 
 # Dead-man's switch: node1 pushes a heartbeat to the `heartbeat` branch every
-# 15 minutes. If the heartbeat goes stale, THIS workflow fails, and GitHub
-# emails whoever last edited the cron line below (Settings > Notifications
-# must have "Actions" failure emails on - it is on by default).
+# 15 minutes. If the heartbeat goes stale, THIS workflow fails and pings
+# Telegram (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID repo secrets).
 #
 # Why this runs in the cloud: it must outlive BOTH node1 and the desktop.
 # A check running on either machine cannot report that machine being gone.
@@ -26,6 +25,7 @@ jobs:
           fetch-depth: 1
 
       - name: Verify the heartbeat is fresh
+        id: hb
         run: |
           set -euo pipefail
           ts=$(tr -d '[:space:]' < heartbeat.txt)
@@ -35,8 +35,30 @@ jobs:
           age=$(( now - hb ))
           echo "age            : ${age}s ($(( age / 60 )) min)"
           echo "threshold      : 2400s (40 min, i.e. 2-3 missed heartbeats)"
+          echo "age_min=$(( age / 60 ))" >> "$GITHUB_OUTPUT"
           if [ "$age" -gt 2400 ]; then
             echo "::error::node1 has not sent a heartbeat for $(( age / 60 )) minutes - it is down or offline."
             exit 1
           fi
           echo "OK - node1 is alive"
+
+      - name: Ping Telegram on failure
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AGE_MIN: ${{ steps.hb.outputs.age_min }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TG_TOKEN:-}" ] || [ -z "${TG_CHAT:-}" ]; then
+            echo "Telegram secrets not set - skipping ping"
+            exit 0
+          fi
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          TEXT=$(printf 'node1 is DOWN\n\nNo heartbeat received for %s min (threshold 40 min).\nThe homelab box is offline or unreachable.\n\n%s' "${AGE_MIN:-?}" "${RUN_URL}")
+          code=$(curl -s -o /tmp/tg.out -w '%{http_code}' \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=${TEXT}" \
+            "https://api.telegram.org/bot${TG_TOKEN}/sendMessage")
+          echo "telegram HTTP $code"
+          cat /tmp/tg.out
